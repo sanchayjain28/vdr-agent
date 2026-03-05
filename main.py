@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import get_settings
-from app.core.routers import health_router
+from app.core.routers import health_router, topics_router
 from app.logging import configure_logging
 from app.startup import lifespan
 
@@ -57,6 +57,7 @@ def create_app() -> FastAPI:
         return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
     app.include_router(health_router)
+    app.include_router(topics_router)
     return app
 
 
