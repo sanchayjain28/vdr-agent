@@ -66,6 +66,26 @@ class TopicDAO:
         return [TopicRecord.from_row(row) for row in rows]
 
     @staticmethod
+    async def list_active_by_project(project_id: UUID) -> List[TopicRecord]:
+        """Return only active topics for a project, ordered by created_at ascending.
+
+        Dedicated shorthand for fitment generation — DB-level filter, not Python filter.
+        Equivalent to list_by_project(project_id, active_only=True) but explicit for
+        clarity at the call site in processor.py.
+        """
+        sql = """
+            SELECT id, project_id, name, instruction, is_active, created_at, updated_at
+            FROM vdr_agent.topics
+            WHERE project_id = %s AND is_active = TRUE
+            ORDER BY created_at ASC
+        """
+        async with DatabasePool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(sql, (project_id,))
+                rows = await cur.fetchall()
+        return [TopicRecord.from_row(row) for row in rows]
+
+    @staticmethod
     async def bulk_insert(
         project_id: UUID,
         topics: list[dict],

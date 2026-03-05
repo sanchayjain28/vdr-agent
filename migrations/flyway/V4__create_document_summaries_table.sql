@@ -7,7 +7,7 @@ SET search_path TO vdr_agent, public;
 
 CREATE TABLE IF NOT EXISTS document_summaries (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    document_id UUID NOT NULL REFERENCES ai_rag.documents(id) ON DELETE CASCADE,
+    document_id UUID NOT NULL,
     summary_text TEXT NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),

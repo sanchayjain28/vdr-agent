@@ -241,6 +241,10 @@ class Settings(BaseSettings):
         default=10,
         description="Max concurrent Bedrock API calls (semaphore) — override with VDR_AGENT_BEDROCK_MAX_CONCURRENT",
     )
+    bedrock_embedding_model: str = Field(
+        default="cohere.embed-english-v3",
+        description="AWS Bedrock embedding model ID for Cohere — override with VDR_AGENT_BEDROCK_EMBEDDING_MODEL",
+    )
     poll_interval_seconds: int = Field(
         default=10,
         description="Poll loop sleep interval in seconds — override with VDR_AGENT_POLL_INTERVAL_SECONDS",

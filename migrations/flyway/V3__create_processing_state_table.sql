@@ -7,7 +7,7 @@ SET search_path TO vdr_agent, public;
 
 CREATE TABLE IF NOT EXISTS processing_state (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    document_id UUID NOT NULL REFERENCES ai_rag.documents(id) ON DELETE CASCADE,
+    document_id UUID NOT NULL,
     summary_status TEXT NOT NULL DEFAULT 'pending',
     processing_started_at TIMESTAMPTZ,
     error_message TEXT,
@@ -32,7 +32,7 @@ CREATE TRIGGER update_processing_state_updated_at
     EXECUTE FUNCTION update_updated_at_column();
 
 COMMENT ON TABLE processing_state IS 'Per-document AI processing status — one row per document';
-COMMENT ON COLUMN processing_state.document_id IS 'FK to ai_rag.documents — cascades delete when source document is removed';
+COMMENT ON COLUMN processing_state.document_id IS 'UUID reference to the source document — no cross-schema FK (managed at application level)';
 COMMENT ON COLUMN processing_state.summary_status IS 'Pipeline status: pending (awaiting pickup), processing (claimed by worker), done (summary generated), failed (error occurred)';
 COMMENT ON COLUMN processing_state.processing_started_at IS 'Set when a worker claims this row (status → processing). Used by poller to detect stale locks. NULL when status is pending/done/failed.';
 COMMENT ON COLUMN processing_state.error_message IS 'Last error message if summary_status = failed';

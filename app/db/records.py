@@ -90,3 +90,30 @@ class FitmentResultRecord:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+
+@dataclass
+class DocumentListRecord:
+    id: UUID
+    file_name: str
+    file_path: str
+    file_type: str
+    page_count: Optional[int]
+    summary_status: str  # COALESCE ensures this is never None
+    summary_text: Optional[str]
+    fitment_done_count: int
+    fitment_total_count: int
+
+    @classmethod
+    def from_row(cls, row: dict) -> "DocumentListRecord":
+        return cls(
+            id=row["id"],
+            file_name=row["file_name"],
+            file_path=row["file_path"],
+            file_type=row["file_type"],
+            page_count=row.get("page_count"),
+            summary_status=row["summary_status"],
+            summary_text=row.get("summary_text"),
+            fitment_done_count=row["fitment_done_count"],
+            fitment_total_count=row["fitment_total_count"],
+        )
