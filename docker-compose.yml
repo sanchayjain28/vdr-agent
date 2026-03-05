@@ -1,0 +1,11 @@
+services:
+  vdr-agent:
+    build: .
+    ports:
+      - "8001:8001"
+    volumes:
+      - .:/app
+    env_file:
+      - .env.local
+    extra_hosts:
+      - "db.host.internal:host-gateway"
