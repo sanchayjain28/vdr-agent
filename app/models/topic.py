@@ -6,7 +6,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from app.db.records import TopicRecord
+from app.db.records import TopicRecord, TopicTemplateRecord
 
 
 class TopicCreate(BaseModel):
@@ -70,3 +70,17 @@ class TopicResponse(BaseModel):
             created_at=record.created_at,
             updated_at=record.updated_at,
         )
+
+
+class TopicTemplateResponse(BaseModel):
+    """Response body for GET /topics/templates."""
+
+    id: int
+    name: str
+    instruction: str
+
+    model_config = {"from_attributes": True}
+
+    @classmethod
+    def from_record(cls, record: TopicTemplateRecord) -> TopicTemplateResponse:
+        return cls(id=record.id, name=record.name, instruction=record.instruction)

@@ -122,6 +122,21 @@ class DocumentListRecord:
 
 
 @dataclass
+class TopicTemplateRecord:
+    id: int
+    name: str
+    instruction: str
+
+    @classmethod
+    def from_row(cls, row: dict) -> "TopicTemplateRecord":
+        return cls(
+            id=row["id"],
+            name=row["name"],
+            instruction=row["instruction"],
+        )
+
+
+@dataclass
 class DocumentScopeAssignmentRecord:
     """Maps 1:1 to a vdr_agent.document_scope_assignments table row.
 

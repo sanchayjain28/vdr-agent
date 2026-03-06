@@ -13,6 +13,7 @@ from app.db.dao.document_scope_assignment_dao import DocumentScopeAssignmentDAO
 from app.db.dao.document_summary_dao import DocumentSummaryDAO
 from app.db.dao.processing_state_dao import ProcessingStateDAO
 from app.db.dao.topic_dao import TopicDAO
+from app.db.dao.topic_template_dao import TopicTemplateDAO
 from app.db.pool import DatabasePool
 from app.models.document import TopicDocumentItem, TopicDocumentsResponse
 from app.models.topic import (
@@ -20,6 +21,7 @@ from app.models.topic import (
     TopicBulkCreate,
     TopicCreate,
     TopicResponse,
+    TopicTemplateResponse,
     TopicUpdate,
 )
 from app.worker.processor import _categorise_document
@@ -61,6 +63,13 @@ async def list_topics(
         active_only=not include_inactive,
     )
     return [TopicResponse.from_record(r) for r in records]
+
+
+@router.get("/templates", response_model=List[TopicTemplateResponse])
+async def list_topic_templates() -> List[TopicTemplateResponse]:
+    """Return all 19 ESG topic templates ordered by id. Used to pre-populate topics on project creation."""
+    records = await TopicTemplateDAO.list_all()
+    return [TopicTemplateResponse.from_record(r) for r in records]
 
 
 @router.post("/bulk", status_code=status.HTTP_201_CREATED, response_model=List[TopicResponse])
