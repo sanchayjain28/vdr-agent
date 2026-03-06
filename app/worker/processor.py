@@ -226,9 +226,16 @@ async def _categorise_document(
         async with get_rate_limiter().acquire():
             response_text = await invoke(user_prompt, system_prompt=CATEGORISATION_SYSTEM_PROMPT)
 
-        # Step 6: Parse JSON response
+        # Step 6: Parse JSON response — strip markdown code fences if present
+        clean_text = response_text.strip()
+        if clean_text.startswith("```"):
+            # Remove opening fence (```json or ```) and closing fence (```)
+            clean_text = clean_text.split("\n", 1)[1] if "\n" in clean_text else clean_text[3:]
+            if clean_text.endswith("```"):
+                clean_text = clean_text[:-3]
+            clean_text = clean_text.strip()
         try:
-            parsed = json.loads(response_text)
+            parsed = json.loads(clean_text)
         except (json.JSONDecodeError, ValueError) as exc:
             LOGGER.error(
                 "Failed to parse categorisation JSON for doc_id=%s: %s — response: %.200r",
