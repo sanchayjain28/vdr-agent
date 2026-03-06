@@ -27,7 +27,6 @@ def create_app() -> FastAPI:
         docs_url="/docs",
         redoc_url="/redoc",
         lifespan=lifespan,
-        root_path="/vdr-agent",
     )
 
     app.state.settings = settings
@@ -56,9 +55,9 @@ def create_app() -> FastAPI:
         )
         return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
-    app.include_router(health_router)
-    app.include_router(topics_router)
-    app.include_router(documents_router)
+    app.include_router(health_router, prefix="/vdr-agent")
+    app.include_router(topics_router, prefix="/vdr-agent")
+    app.include_router(documents_router, prefix="/vdr-agent")
     return app
 
 

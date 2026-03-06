@@ -116,11 +116,42 @@ class ProcessingStateDAO:
         return reset_count
 
     @staticmethod
+    async def update_categorisation_status(
+        processing_state_id: UUID,
+        status: str,
+    ) -> None:
+        """Update categorisation_status for a single processing_state row.
+
+        Called by the categorisation pipeline (Phase 13) after LLM categorisation
+        completes (status='done'), when no scopes match (status='uncategorised'),
+        or on failure (status='failed').
+
+        This is intentionally a short, separate transaction — not the same connection
+        used during claim_documents() or Bedrock calls.
+
+        Valid statuses: 'pending', 'processing', 'done', 'uncategorised', 'failed'.
+        """
+        sql = """
+            UPDATE vdr_agent.processing_state
+            SET categorisation_status = %s,
+                updated_at = NOW()
+            WHERE id = %s
+        """
+        async with DatabasePool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(sql, (status, processing_state_id))
+            await conn.commit()
+        LOGGER.debug(
+            "Updated processing_state id=%s categorisation_status=%s",
+            processing_state_id, status,
+        )
+
+    @staticmethod
     async def get_by_document(document_id: UUID) -> Optional[ProcessingStateRecord]:
         """Fetch processing state for a document. Returns None if no row exists."""
         sql = """
-            SELECT id, document_id, summary_status, processing_started_at,
-                   created_at, updated_at
+            SELECT id, document_id, summary_status, categorisation_status,
+                   processing_started_at, created_at, updated_at
             FROM vdr_agent.processing_state
             WHERE document_id = %s
         """
@@ -144,8 +175,8 @@ class ProcessingStateDAO:
             INSERT INTO vdr_agent.processing_state (document_id, summary_status)
             VALUES (%s, 'pending')
             ON CONFLICT (document_id) DO NOTHING
-            RETURNING id, document_id, summary_status, processing_started_at,
-                      created_at, updated_at
+            RETURNING id, document_id, summary_status, categorisation_status,
+                      processing_started_at, created_at, updated_at
         """
         async with DatabasePool.connection() as conn:
             async with conn.cursor() as cur:

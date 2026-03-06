@@ -38,6 +38,13 @@ class TopicBulkCreate(BaseModel):
     topics: List[TopicBulkItem] = Field(..., min_length=1)
 
 
+class ReclassifyResponse(BaseModel):
+    """Response body for POST /topics/{id}/reclassify (202 Accepted)."""
+
+    message: str
+    project_id: UUID
+
+
 class TopicResponse(BaseModel):
     """Response body for all topic endpoints that return a topic."""
 

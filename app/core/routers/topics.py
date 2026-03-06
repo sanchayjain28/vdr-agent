@@ -1,22 +1,34 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import List
+from typing import List, Set
 
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
 from psycopg.errors import UniqueViolation
 
+from app.db.dao.document_scope_assignment_dao import DocumentScopeAssignmentDAO
+from app.db.dao.document_summary_dao import DocumentSummaryDAO
+from app.db.dao.processing_state_dao import ProcessingStateDAO
 from app.db.dao.topic_dao import TopicDAO
+from app.db.pool import DatabasePool
+from app.models.document import TopicDocumentItem, TopicDocumentsResponse
 from app.models.topic import (
+    ReclassifyResponse,
     TopicBulkCreate,
     TopicCreate,
     TopicResponse,
     TopicUpdate,
 )
+from app.worker.processor import _categorise_document
 
 LOGGER = logging.getLogger(__name__)
+
+# In-memory set of project_ids with active reclassification tasks.
+# Lost on server restart — acceptable since reclassification is short-lived.
+_reclassifying_projects: Set[UUID] = set()
 
 router = APIRouter(prefix="/topics", tags=["topics"])
 
@@ -99,3 +111,149 @@ async def delete_topic(topic_id: UUID) -> Response:
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Topic not found")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+async def _reclassify_all_documents(project_id: UUID) -> None:
+    """Background task: re-classify ALL project documents.
+
+    For each document with a processing_state row:
+      1. Fetch summary_text from document_summaries
+      2. Fetch chunks from ai_rag.document_pages (same SQL as processor.py)
+      3. Delete existing scope assignments
+      4. Call _categorise_document (handles its own error isolation)
+
+    Concurrency guard is released in finally block.
+    """
+    try:
+        # Fetch all processing_state rows for the project's documents
+        async with DatabasePool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT ps.id AS processing_state_id, ps.document_id
+                    FROM vdr_agent.processing_state ps
+                    JOIN ai_rag.documents d ON d.id = ps.document_id
+                    WHERE d.project_id = %s
+                      AND d.status = 'completed'
+                    """,
+                    (project_id,),
+                )
+                doc_rows = await cur.fetchall()
+
+        LOGGER.info(
+            "Reclassify started: project_id=%s documents=%d",
+            project_id, len(doc_rows),
+        )
+
+        for row in doc_rows:
+            ps_id = row["processing_state_id"]
+            doc_id = row["document_id"]
+
+            # Fetch summary text
+            summary_rec = await DocumentSummaryDAO.get_by_document(doc_id)
+            if not summary_rec or not summary_rec.summary_text:
+                LOGGER.warning(
+                    "Reclassify skip: no summary for doc_id=%s", doc_id
+                )
+                continue
+
+            # Fetch chunks (same pattern as processor.py re-run path)
+            async with DatabasePool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        SELECT content
+                        FROM ai_rag.document_pages
+                        WHERE document_id = %s
+                        ORDER BY page_number ASC
+                        """,
+                        (doc_id,),
+                    )
+                    chunk_rows = await cur.fetchall()
+            chunks = [r["content"] for r in chunk_rows]
+
+            # Delete existing assignments before re-categorisation
+            await DocumentScopeAssignmentDAO.delete_by_document(doc_id)
+
+            # Run categorisation (error-isolated, never re-raises)
+            await _categorise_document(
+                processing_state_id=ps_id,
+                document_id=doc_id,
+                project_id=project_id,
+                summary_text=summary_rec.summary_text,
+                chunks=chunks,
+            )
+
+        LOGGER.info("Reclassify completed: project_id=%s", project_id)
+    except Exception as exc:
+        LOGGER.error(
+            "Reclassify failed: project_id=%s error=%s",
+            project_id, exc, exc_info=True,
+        )
+    finally:
+        _reclassifying_projects.discard(project_id)
+
+
+@router.post("/{topic_id}/reclassify", status_code=status.HTTP_202_ACCEPTED, response_model=ReclassifyResponse)
+async def reclassify_topic_documents(topic_id: UUID) -> ReclassifyResponse:
+    """POST /topics/{id}/reclassify — trigger re-classification of all project documents.
+
+    Returns 202 Accepted immediately. Re-classification runs as a background asyncio task.
+    Returns 404 if topic_id does not exist.
+    Returns 409 if a reclassification is already running for the same project.
+    """
+    topic = await TopicDAO.get_by_id(topic_id)
+    if topic is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Topic not found")
+
+    project_id = topic.project_id
+
+    if project_id in _reclassifying_projects:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Re-classification already in progress for this project",
+        )
+
+    _reclassifying_projects.add(project_id)
+    asyncio.create_task(_reclassify_all_documents(project_id))
+
+    return ReclassifyResponse(
+        message="Re-classification started for all project documents",
+        project_id=project_id,
+    )
+
+
+@router.get("/{topic_id}/documents", response_model=TopicDocumentsResponse)
+async def list_topic_documents(
+    topic_id: UUID,
+    limit: int = Query(20, ge=1, le=100, description="Page size"),
+    offset: int = Query(0, ge=0, description="Offset for pagination"),
+) -> TopicDocumentsResponse:
+    """GET /topics/{id}/documents — paginated documents classified under a topic.
+
+    Returns 404 when topic_id does not exist.
+    Returns empty documents array (not 404) when topic exists but has no assignments.
+    Pagination defaults: limit=20, offset=0. Max limit: 100.
+    """
+    topic = await TopicDAO.get_by_id(topic_id)
+    if topic is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Topic not found")
+
+    records, total_count = await DocumentScopeAssignmentDAO.list_by_topic(
+        topic_id, limit=limit, offset=offset
+    )
+
+    LOGGER.debug(
+        "list_topic_documents topic_id=%s total_count=%d limit=%d offset=%d",
+        topic_id,
+        total_count,
+        limit,
+        offset,
+    )
+
+    return TopicDocumentsResponse(
+        total_count=total_count,
+        limit=limit,
+        offset=offset,
+        documents=[TopicDocumentItem.from_record(r) for r in records],
+    )

@@ -7,12 +7,13 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query, status
 
 from app.db.dao.document_list_dao import DocumentListDAO
+from app.db.dao.document_scope_assignment_dao import DocumentScopeAssignmentDAO
 from app.db.dao.document_summary_dao import DocumentSummaryDAO
 from app.db.dao.fitment_result_dao import FitmentResultDAO
 from app.db.dao.processing_state_dao import ProcessingStateDAO
 from app.db.dao.topic_dao import TopicDAO
 from app.db.pool import DatabasePool
-from app.models.document import DocumentListItem, FitmentItem, SummaryResponse
+from app.models.document import DocumentListItem, FitmentItem, ScopeAssignmentItem, ScopesResponse, SummaryResponse
 
 LOGGER = logging.getLogger(__name__)
 
@@ -86,6 +87,56 @@ async def get_document_fitment(document_id: UUID) -> List[FitmentItem]:
             reasoning=row.reasoning if row else None,
         ))
     return result
+
+
+@router.get("/{document_id}/scopes", response_model=ScopesResponse)
+async def get_document_scopes(document_id: UUID) -> ScopesResponse:
+    """GET /documents/{id}/scopes — scope assignments with topic names and categorisation status.
+
+    Returns 200 for ALL known documents regardless of categorisation state.
+    Returns 404 only when document_id does not exist in ai_rag.documents.
+    Returns empty scopes array (not 404) when no assignments exist yet.
+    categorisation_status falls back to 'pending' when no processing_state row exists.
+    Uses active_only=False when resolving topic names — assignments may reference
+    soft-deleted topics.
+    """
+    doc_row = await _get_document_or_404(document_id)
+    project_id = doc_row["project_id"]
+
+    state = await ProcessingStateDAO.get_by_document(document_id)
+    assignments = await DocumentScopeAssignmentDAO.list_by_document(document_id)
+
+    # Batch-fetch all topics (including inactive) once for O(1) name lookup
+    all_topics = await TopicDAO.list_by_project(project_id, active_only=False)
+    topic_name_by_id = {t.id: t.name for t in all_topics}
+
+    scopes = [
+        ScopeAssignmentItem(
+            topic_id=a.topic_id,
+            topic_name=topic_name_by_id.get(a.topic_id, str(a.topic_id)),
+            confidence=a.confidence,
+            justification=a.justification,
+            needs_review=a.needs_review,
+            review_reason=a.review_reason,
+            rank=idx + 1,
+            created_at=a.created_at,
+            updated_at=a.updated_at,
+        )
+        for idx, a in enumerate(assignments)
+    ]
+
+    LOGGER.debug(
+        "get_document_scopes document_id=%s categorisation_status=%s scopes=%d",
+        document_id,
+        state.categorisation_status if state else "pending",
+        len(scopes),
+    )
+
+    return ScopesResponse(
+        document_id=document_id,
+        categorisation_status=state.categorisation_status if state else "pending",
+        scopes=scopes,
+    )
 
 
 @router.get("", response_model=List[DocumentListItem])

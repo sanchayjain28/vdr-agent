@@ -9,12 +9,14 @@ from uuid import UUID
 from app.config import get_settings
 from app.core.llm.claude_client import ClaudeClientError, _get_bedrock_client, invoke
 from app.core.llm.rate_limiter import get_rate_limiter
+from app.db.dao.document_scope_assignment_dao import DocumentScopeAssignmentDAO
 from app.db.dao.document_summary_dao import DocumentSummaryDAO
 from app.db.dao.fitment_result_dao import FitmentResultDAO
 from app.db.dao.processing_state_dao import ProcessingStateDAO
 from app.db.dao.topic_dao import TopicDAO
 from app.db.pool import DatabasePool
 from app.db.records import TopicRecord
+from app.prompts.categorisation import CATEGORISATION_SYSTEM_PROMPT, build_categorisation_prompt
 
 LOGGER = logging.getLogger(__name__)
 
@@ -161,6 +163,147 @@ async def _evaluate_topic(
         await FitmentResultDAO.upsert(document_id, topic.id, None, status="failed")
 
 
+async def _categorise_document(
+    processing_state_id: UUID,
+    document_id: UUID,
+    project_id: UUID,
+    summary_text: str,
+    chunks: list[str],
+) -> None:
+    """Classify a document into ESG scopes using a single LLM call.
+
+    Pipeline:
+      1. Set categorisation_status to 'processing'.
+      2. Fetch active topics for the project (for prompt injection, EINST-01).
+      3. Fetch document metadata (file_name, file_path, file_type).
+      4. Build the categorisation prompt.
+      5. Invoke Claude under rate limiter (exactly one call per document, SCPIPE-01).
+      6. Parse JSON response.
+      7. Handle empty scopes -> mark 'uncategorised' (SCPIPE-05).
+      8. Resolve scope names to topic_ids via case-insensitive match (SCPIPE-03).
+      9. Build assignment dicts (SCPIPE-04).
+      10. Persist via DocumentScopeAssignmentDAO.bulk_upsert.
+      11. Set categorisation_status to 'done'.
+
+    On any error: logs, sets categorisation_status='failed', does NOT re-raise.
+    DB connections are always released before the LLM call.
+    """
+    try:
+        # Step 1: Set categorisation_status to 'processing'
+        await ProcessingStateDAO.update_categorisation_status(processing_state_id, "processing")
+
+        # Step 2: Fetch active topics for project
+        active_topics = await TopicDAO.list_active_by_project(project_id)
+
+        # Step 3: Fetch document metadata — short-lived connection released before LLM call
+        async with DatabasePool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT file_name, file_path, file_type FROM ai_rag.documents WHERE id = %s",
+                    (document_id,),
+                )
+                doc_meta = await cur.fetchone()
+
+        if doc_meta is None:
+            LOGGER.error(
+                "ai_rag.documents row missing for doc_id=%s — cannot run categorisation",
+                document_id,
+            )
+            await ProcessingStateDAO.update_categorisation_status(processing_state_id, "failed")
+            return
+
+        # Step 4: Build the categorisation prompt
+        user_prompt = build_categorisation_prompt(
+            file_name=doc_meta["file_name"],
+            file_path=doc_meta["file_path"],
+            file_type=doc_meta["file_type"],
+            summary_text=summary_text,
+            chunks=chunks,
+            topics=active_topics,
+        )
+
+        # Step 5: Invoke LLM under rate limiter (exactly one call per document, SCPIPE-01)
+        async with get_rate_limiter().acquire():
+            response_text = await invoke(user_prompt, system_prompt=CATEGORISATION_SYSTEM_PROMPT)
+
+        # Step 6: Parse JSON response
+        try:
+            parsed = json.loads(response_text)
+        except (json.JSONDecodeError, ValueError) as exc:
+            LOGGER.error(
+                "Failed to parse categorisation JSON for doc_id=%s: %s — response: %.200r",
+                document_id, exc, response_text,
+            )
+            await ProcessingStateDAO.update_categorisation_status(processing_state_id, "failed")
+            return
+
+        scopes = parsed.get("scopes", [])
+
+        # Step 7: Handle empty scopes — mark 'uncategorised', no sentinel rows (SCPIPE-05)
+        if not scopes:
+            await ProcessingStateDAO.update_categorisation_status(processing_state_id, "uncategorised")
+            LOGGER.info(
+                "No scopes returned for doc_id=%s — marking uncategorised", document_id
+            )
+            return
+
+        # Step 8: Resolve scope names to topic_ids via case-insensitive match (SCPIPE-03)
+        topic_lookup = {t.name.lower(): t.id for t in active_topics}
+        matched_assignments = []
+        unmatched_names = []
+
+        for scope in scopes:
+            scope_name = scope.get("name", "")
+            topic_id = topic_lookup.get(scope_name.lower())
+            if topic_id is not None:
+                matched_assignments.append((topic_id, scope))
+            else:
+                unmatched_names.append(scope_name)
+                LOGGER.warning(
+                    "Unmatched scope name %r for doc_id=%s — no topic found",
+                    scope_name, document_id,
+                )
+
+        # If any scope name was unmatched, flag ALL matched assignments as needs_review (SCPIPE-03)
+        has_unmatched = bool(unmatched_names)
+        review_reason_text = (
+            f"Unmatched scope names: {', '.join(unmatched_names)}" if has_unmatched else None
+        )
+
+        # Step 9: Build assignment dicts for bulk_upsert (SCPIPE-04)
+        assignments = [
+            {
+                "document_id": document_id,
+                "topic_id": topic_id,
+                "confidence": scope.get("confidence"),  # HIGH|MEDIUM|LOW
+                "justification": scope.get("justification"),
+                "needs_review": has_unmatched,
+                "review_reason": review_reason_text if has_unmatched else None,
+                "raw_response": parsed,  # Full LLM JSON for audit
+            }
+            for topic_id, scope in matched_assignments
+        ]
+
+        # Step 10: Persist via bulk_upsert
+        if assignments:
+            await DocumentScopeAssignmentDAO.bulk_upsert(assignments)
+
+        # Step 11: Set categorisation_status to 'done'
+        await ProcessingStateDAO.update_categorisation_status(processing_state_id, "done")
+
+        LOGGER.info(
+            "Categorisation complete: doc_id=%s scopes_matched=%d unmatched=%d",
+            document_id, len(assignments), len(unmatched_names),
+        )
+
+    except Exception:
+        LOGGER.exception(
+            "Categorisation failed: ps_id=%s doc_id=%s", processing_state_id, document_id
+        )
+        await ProcessingStateDAO.update_categorisation_status(processing_state_id, "failed")
+        # Do NOT re-raise — summary remains accessible and usable
+
+
 async def _summarise_section(section_chunks: list[str], section_index: int) -> str:
     """Summarise one section under the global rate limiter.
 
@@ -177,22 +320,24 @@ async def _summarise_section(section_chunks: list[str], section_index: int) -> s
 
 
 async def process_document(processing_state_id: UUID, document_id: UUID) -> None:
-    """Generate an AI summary for one document, then run fitment for all active topics.
+    """Generate an AI summary for one document, then run scope categorisation.
 
     Pipeline:
-      Re-run safety: if summary already exists, skip to fitment.
+      Re-run safety: if summary already exists, skip to categorisation.
       Else:
         Phase 1. Fetch all embedding chunks (short-lived DB connection).
         Phase 2+3. Parallel section summaries -> combine -> final_summary.
-        Phase 4. Persist summary; set processing_state = 'done'.
-      Phase 7. Fitment generation for all active topics (inside outer try).
+        Phase 4. Persist summary; set summary_status = 'done'.
+      Phase 5. Fetch project_id for categorisation.
+      Phase 6. Scope categorisation via _categorise_document().
+      Phase 7 (Fitment): Skipped — replaced by scope categorisation above. Code retained for potential future use.
 
     On summary pipeline failure: sets summary_status = 'failed' and returns.
-    Phase 7 does NOT touch processing_state — it only writes to fitment_results.
+    Categorisation errors are handled inside _categorise_document (sets categorisation_status).
     Signature is fixed — poller.py passes (processing_state_id, document_id) unchanged.
     """
     # ── Re-run safety: skip summary if already generated ────────────────────
-    # If document_summaries already has a row, jump directly to fitment.
+    # If document_summaries already has a row, jump directly to categorisation.
     # Prevents re-generating summaries when poller re-claims a crashed document.
     try:
         existing_summary = await DocumentSummaryDAO.get_by_document(document_id)
@@ -204,10 +349,29 @@ async def process_document(processing_state_id: UUID, document_id: UUID) -> None
 
     if existing_summary is not None:
         LOGGER.info(
-            "Summary already exists for doc_id=%s — skipping to fitment", document_id
+            "Summary already exists for doc_id=%s — skipping to categorisation", document_id
         )
         final_summary = existing_summary.summary_text
-        # Jump directly to the fitment block below — skip Phase 1-4 entirely.
+        # Re-run path: chunks must be fetched for categorisation prompt
+        sql_chunks = """
+            SELECT content, chunk_index
+            FROM ai_rag.embeddings
+            WHERE document_id = %s
+            ORDER BY chunk_index
+        """
+        try:
+            async with DatabasePool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(sql_chunks, (document_id,))
+                    chunk_rows = await cur.fetchall()
+            chunks = [row["content"] for row in chunk_rows]
+        except Exception:
+            LOGGER.exception(
+                "Failed to fetch chunks for re-run categorisation doc_id=%s ps_id=%s",
+                document_id, processing_state_id,
+            )
+            chunks = []
+        # Jump directly to the categorisation block below — skip Phase 1-4 entirely.
     else:
         # ── Phase 1: Fetch chunks ────────────────────────────────────────────
         # Short-lived connection — must be closed before any Bedrock call to avoid
@@ -299,11 +463,9 @@ async def process_document(processing_state_id: UUID, document_id: UUID) -> None
             await ProcessingStateDAO.update_status(processing_state_id, "failed")
             return  # Do not run fitment if summary generation failed
 
-    # ── Phase 7: Fitment Generation ──────────────────────────────────────────
+    # ── Phase 5: Fetch project_id for categorisation ─────────────────────────
     # Runs whether summary was freshly generated (else branch) or already existed
-    # (if branch). final_summary is set in both branches above.
-    # Phase 7 does NOT update processing_state — summary_status remains 'done'
-    # (set by Phase 6). Only fitment_results rows are written here.
+    # (if branch). final_summary and chunks are set in both branches above.
     try:
         async with DatabasePool.connection() as conn:
             async with conn.cursor() as cur:
@@ -314,45 +476,26 @@ async def process_document(processing_state_id: UUID, document_id: UUID) -> None
                 doc_row = await cur.fetchone()
         if doc_row is None:
             LOGGER.error(
-                "ai_rag.documents row missing for doc_id=%s — cannot run fitment",
+                "ai_rag.documents row missing for doc_id=%s — cannot run categorisation",
                 document_id,
             )
             return
         project_id = doc_row["project_id"]
     except Exception:
         LOGGER.exception(
-            "Failed to fetch project_id for doc_id=%s — skipping fitment", document_id
+            "Failed to fetch project_id for doc_id=%s — skipping categorisation", document_id
         )
         return
 
-    active_topics = await TopicDAO.list_active_by_project(project_id)
-    if not active_topics:
-        LOGGER.warning(
-            "No active topics for project_id=%s doc_id=%s — skipping fitment",
-            project_id, document_id,
-        )
-        return
-
-    LOGGER.info(
-        "Starting fitment: doc_id=%s topics=%d", document_id, len(active_topics)
+    # ── Phase 6: Scope Categorisation ────────────────────────────────────────
+    # Exactly one LLM call per document (SCPIPE-01).
+    # Errors are handled inside _categorise_document — never propagated here.
+    await _categorise_document(
+        processing_state_id=processing_state_id,
+        document_id=document_id,
+        project_id=project_id,
+        summary_text=final_summary,
+        chunks=chunks,
     )
 
-    bedrock_client = _get_bedrock_client()
-    embedding_model = get_settings().bedrock_embedding_model
-
-    topic_tasks = [
-        _evaluate_topic(document_id, topic, final_summary, bedrock_client, embedding_model)
-        for topic in active_topics
-    ]
-    results = await asyncio.gather(*topic_tasks, return_exceptions=True)
-
-    for topic, result in zip(active_topics, results):
-        if isinstance(result, BaseException):
-            LOGGER.error(
-                "Unhandled fitment error topic=%r doc_id=%s: %s",
-                topic.name, document_id, result,
-            )
-
-    LOGGER.info(
-        "Fitment done: doc_id=%s topics_evaluated=%d", document_id, len(active_topics)
-    )
+    # ── Phase 7 (Fitment): Skipped — replaced by scope categorisation above. Code retained for potential future use. ──
